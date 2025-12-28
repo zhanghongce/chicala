@@ -15,10 +15,32 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     }
   }
 
-  private var currentPkg: String = ""
+  private var currentPkg: String         = ""
+  private var localBindings: Set[String] = Set.empty
+  private var localBindingTypes: Map[String, MType] = Map.empty
+  private var defaultWidthParam: Option[String] = None
+  private var moduleParamNames: Set[String] = Set.empty
+  private var currentNatParam: Option[String] = None
+  private var currentBitVecParamWidth: Option[String] = None
+  private var localRenames: Map[String, String] = Map.empty
+
+  private def leanIdent(name: String): String = name.replace("$", "_")
 
   private def moduleDefToCode(moduleDef: ModuleDef): CodeLines = {
     currentPkg = moduleDef.pkg
+    defaultWidthParam = moduleDef.vparams
+      .map(_.name.toString())
+      .find(n => {
+        val lower = n.toLowerCase()
+        lower == "w" || lower.contains("width") || lower.contains("len") || lower.contains("bits")
+      })
+    moduleParamNames = moduleDef.vparams.map(_.name.toString()).toSet
+    val valNames = moduleDef.body.collect { case s: SValDef => s.name.toString() }
+    val unapplyNames = moduleDef.body.collect { case s: SUnapplyDef => s.names.map(_.toString()) }.flatten
+    val enumNames = moduleDef.body.collect { case e: EnumDef => e.names.map(_.toString()) }.flatten
+    localBindings = (valNames ++ unapplyNames ++ enumNames).toSet
+    localBindingTypes = Map.empty
+    localRenames = Map.empty
 
     val moduleName = moduleDef.name.toString()
     val inputsName = moduleName + "Inputs"
@@ -27,7 +49,7 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     val stateName = moduleName + "State"
     val transName = s"${moduleName.head.toLower}${moduleName.tail}Trans"
 
-    val params = moduleDef.vparams.map(v => s"${v.name} : ${sTypeToLean(v.tpe)}")
+    val params = moduleDef.vparams.map(v => s"${leanIdent(v.name.toString())} : ${sTypeToLean(v.tpe)}")
 
     val ioDef = moduleDef.ioDef
     val ioSignals = ioDef.tpe.flatten(ioDef.name.toString())
@@ -40,13 +62,19 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
 
     val wireDefs = moduleDef.body.collect { case w: WireDef => w }
     val nodeDefs = moduleDef.body.collect { case n: NodeDef => n }
+    val sValDefs = moduleDef.body.collect { case s: SValDef => s }
+    val sUnapplyDefs = moduleDef.body.collect { case s: SUnapplyDef => s }
 
     val stateSignals = {
-      val fields = scala.collection.mutable.LinkedHashMap.empty[String, SignalType]
+      val fields = scala.collection.mutable.LinkedHashMap.empty[String, MType]
       outputSignals.foreach { case (name, tpe) => fields.update(name, tpe) }
       regSignals.foreach { case (name, tpe) => fields.update(name + "_next", tpe) }
       wireDefs.foreach { case WireDef(name, tpe, _, _) => fields.update(name.toString(), tpe) }
       nodeDefs.foreach { case NodeDef(name, tpe, _, _) => fields.update(name.toString(), tpe) }
+      sValDefs.foreach { case SValDef(name, tpe, _, _) => fields.update(name.toString(), tpe) }
+      sUnapplyDefs.foreach { case SUnapplyDef(names, _, tpe) =>
+        names.zip(tpe.tparams).foreach { case (name, mt) => fields.update(name.toString(), mt) }
+      }
       fields.toList
     }
 
@@ -59,34 +87,108 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
          |
          |namespace ${moduleDef.pkg}
          |
-         |/-- Interpret a 1-bit bitvector as a Boolean guard. -/
-         |def bv1IsTrue (v : BitVec 1) : Bool :=
-         |  v != 0
-         |
+        |/-- Interpret a bitvector as a Boolean guard. -/
+        |def bv1IsTrue {w : Nat} (v : BitVec w) : Bool :=
+        |  v.toNat != 0
+        |
         |/-- Convert Bool into a 1-bit bitvector. -/
         |def boolToBv1 (b : Bool) : BitVec 1 :=
         |  if b then (BitVec.ofNat 1 1) else (BitVec.ofNat 1 0)
         |
-        |/-- Select an element from a list (Vec). -/
-        |def vecSelect {α : Type} (xs : List α) (i : Nat) : α :=
-        |  xs.get! i
+        |instance instInhabitedBitVec (n : Nat) : Inhabited (BitVec n) :=
+        |  ⟨BitVec.ofNat n 0⟩
+        |
+        |/-- Bit-length of a natural number. -/
+        |def bitLength (n : Nat) : Nat :=
+        |  if n = 0 then 0 else Nat.log2 n + 1
+        |
+        |/-- log2 ceiling for natural numbers. -/
+        |def log2Ceil (n : Nat) : Nat :=
+        |  if n <= 1 then 0 else Nat.log2 (n - 1) + 1
+        |
+        |/-- log2 floor for natural numbers. -/
+        |def log2Floor (n : Nat) : Nat :=
+        |  Nat.log2 n
+        |
+        |/-- log2Up mirrors Chisel's utility. -/
+        |def log2Up (n : Nat) : Nat :=
+        |  log2Ceil n
+        |
+        |/-- Shift-left for natural numbers. -/
+        |def natShiftLeft (a b : Nat) : Nat :=
+        |  a * (Nat.pow 2 b)
+        |
+        |/-- Shift-right for natural numbers. -/
+        |def natShiftRight (a b : Nat) : Nat :=
+        |  a / (Nat.pow 2 b)
+        |
+        |/-- Cast a bitvector to the requested width. -/
+        |def bvCast {w : Nat} (a : BitVec w) (n : Nat) : BitVec n :=
+        |  BitVec.ofNat n a.toNat
+        |
+        |/-- Build a bitvector from a signed integer (two's complement). -/
+        |def bvOfInt (n : Nat) (i : Int) : BitVec n :=
+        |  if h : i >= 0 then
+        |    BitVec.ofNat n (Int.toNat i)
+        |  else
+        |    let m := Nat.pow 2 n
+        |    let k := Int.toNat (-i) % m
+        |    BitVec.ofNat n (m - k)
+        |
+        |/-- Select an element from a list (Vec), returning `default` if out of range. -/
+        |def vecSelect {α : Type} [Inhabited α] (xs : List α) (i : Nat) : α :=
+        |  match xs, i with
+        |  | [], _ => default
+        |  | x :: _, 0 => x
+        |  | _ :: xs, n + 1 => vecSelect xs n
         |
         |/-- Update an element in a list (Vec). -/
         |def vecUpdate {α : Type} (xs : List α) (i : Nat) (v : α) : List α :=
-        |  xs.set! i v
+        |  match xs, i with
+        |  | [], _ => []
+        |  | _ :: xs, 0 => v :: xs
+        |  | x :: xs, n + 1 => x :: vecUpdate xs n v
         |
         |/-- Bitvector concatenation. -/
-        |opaque bvCat {w1 w2 : Nat} (a : BitVec w1) (b : BitVec w2) : BitVec (w1 + w2)
+        |def bvCat {w1 w2 : Nat} (a : BitVec w1) (b : BitVec w2) : BitVec (w1 + w2) :=
+        |  BitVec.ofNat (w1 + w2) (a.toNat * (Nat.pow 2 w2) + b.toNat)
         |
         |/-- Bitvector slice (hi downto lo). -/
-        |opaque bvSlice {w : Nat} (a : BitVec w) (hi lo : Nat) : BitVec (hi - lo + 1)
+        |def bvSlice {w : Nat} (a : BitVec w) (hi lo : Nat) : BitVec (hi - lo + 1) :=
+        |  let width := hi - lo + 1
+        |  BitVec.ofNat width ((a.toNat / (Nat.pow 2 lo)) % (Nat.pow 2 width))
+        |
+        |/-- Zero-extend a bitvector to the requested width. -/
+        |def bvZeroExt {w : Nat} (a : BitVec w) (n : Nat) : BitVec n :=
+        |  BitVec.ofNat n a.toNat
+        |
+        |/-- Sign-extend a bitvector to the requested width (Chisel-style). -/
+        |def bvSignExt {w : Nat} (a : BitVec w) (n : Nat) : BitVec n :=
+        |  if h : w >= n then
+        |    BitVec.ofNat n (a.toNat % (Nat.pow 2 n))
+        |  else
+        |    let signBit :=
+        |      if h0 : w = 0 then
+        |        0
+        |      else
+        |        (a.toNat / (Nat.pow 2 (w - 1))) % 2
+        |    let extVal :=
+        |      if signBit = 0 then
+        |        a.toNat
+        |      else
+        |        a.toNat + (Nat.pow 2 w) * (Nat.pow 2 (n - w) - 1)
+        |    BitVec.ofNat n extVal
+        |
+        |/-- Log2 over bitvectors, with explicit output width. -/
+        |def log2 {w n : Nat} (a : BitVec w) (max : Nat) : BitVec n :=
+        |  BitVec.ofNat n (bitLength a.toNat)
         |""".stripMargin
     )
 
     val inputsStruct = structDef(inputsName, params, inputSignals)
     val outputsStruct = structDef(outputsName, params, outputSignals)
     val regsStruct = structDef(regsName, params, regSignals)
-    val stateStruct = structDef(stateName, params, stateSignals)
+    val stateStruct = stateStructDef(stateName, params, stateSignals)
 
     val transDef = transDefCL(
       transName,
@@ -100,6 +202,8 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
       regSignals,
       wireDefs,
       nodeDefs,
+      sValDefs,
+      sUnapplyDefs,
       stateSignals,
       moduleDef.body
     )
@@ -136,6 +240,21 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
       )
   }
 
+  private def stateStructDef(
+      structName: String,
+      params: List[String],
+      fields: List[(String, MType)]
+  ): CodeLines = {
+    val fieldLines = fields.map { case (name, tpe) => s"${name} : ${mTypeToLean(tpe)}" }
+    if (fieldLines.isEmpty)
+      CodeLines(s"structure ${structName}${paramsSignature(params)} where")
+    else
+      CodeLines(
+        s"structure ${structName}${paramsSignature(params)} where",
+        fieldLines.toCodeLines.indented
+      )
+  }
+
   private def transDefCL(
       transName: String,
       params: List[String],
@@ -148,7 +267,9 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
       regSignals: List[(String, SignalType)],
       wireDefs: List[WireDef],
       nodeDefs: List[NodeDef],
-      stateSignals: List[(String, SignalType)],
+      sValDefs: List[SValDef],
+      sUnapplyDefs: List[SUnapplyDef],
+      stateSignals: List[(String, MType)],
       body: List[MStatement]
   ): CodeLines = {
     val inputsArg = s"(inputs : ${inputsName}${paramsUse(params)})"
@@ -162,13 +283,26 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
       regSignals,
       wireDefs,
       nodeDefs,
+      sValDefs,
+      sUnapplyDefs,
       stateSignals
     )
 
-    val (finalStateName, bodyCL) = applyStatementsCL(body, "st0")
+    val stateType = s"${stateName}${paramsUse(params)}"
+    val (finalStateName, bodyCL) = applyStatementsCL(body, "st0", Some(stateType))
 
-    val outputsMk = mkStruct(outputsName, params, outputSignals.map(_._1), finalStateName)
-    val regsMk = mkStruct(regsName, params, regSignals.map(_._1 + "_next"), finalStateName)
+    val outputsMk = mkStructFromState(
+      outputsName,
+      params,
+      outputSignals.map(x => (x._1, x._1)),
+      finalStateName
+    )
+    val regsMk = mkStructFromState(
+      regsName,
+      params,
+      regSignals.map(x => (x._1, x._1 + "_next")),
+      finalStateName
+    )
 
     CodeLines(
       s"def ${transName}${paramsSignature(params)} ${inputsArg} ${regsArg} : ${returnType} :=",
@@ -187,7 +321,9 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
       regSignals: List[(String, SignalType)],
       wireDefs: List[WireDef],
       nodeDefs: List[NodeDef],
-      stateSignals: List[(String, SignalType)]
+      sValDefs: List[SValDef],
+      sUnapplyDefs: List[SUnapplyDef],
+      stateSignals: List[(String, MType)]
   ): CodeLines = {
     val initMap = scala.collection.mutable.Map.empty[String, String]
 
@@ -198,15 +334,22 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
       initMap.update(name + "_next", s"regs.${name}")
     }
     wireDefs.foreach { case WireDef(name, tpe, someInit, _) =>
-      val init = someInit.map(mTermToLean(_, "st0", leftSide = false)).getOrElse(signalDefault(tpe))
-      initMap.update(name.toString(), init)
+      initMap.update(name.toString(), signalDefault(tpe))
     }
     nodeDefs.foreach { case NodeDef(name, tpe, rhs, _) =>
-      initMap.update(name.toString(), mTermToLean(rhs, "st0", leftSide = false))
+      initMap.update(name.toString(), mTypeDefault(tpe))
+    }
+    sValDefs.foreach { case SValDef(name, tpe, rhs, _) =>
+      initMap.update(name.toString(), mTypeDefault(tpe))
+    }
+    sUnapplyDefs.foreach { case SUnapplyDef(names, _, tpe) =>
+      names.zip(tpe.tparams).foreach { case (name, mt) =>
+        initMap.update(name.toString(), mTypeDefault(mt))
+      }
     }
 
     val initFields = stateSignals.map { case (name, tpe) =>
-      val init = initMap.getOrElse(name, signalDefault(tpe))
+      val init = initMap.getOrElse(name, mTypeDefault(tpe))
       s"${name} := ${init}"
     }
 
@@ -228,25 +371,30 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     )
   }
 
-  private def mkStruct(structName: String, params: List[String], fieldNames: List[String], stateName: String): String = {
+  private def mkStructFromState(
+      structName: String,
+      params: List[String],
+      fieldNames: List[(String, String)],
+      stateName: String
+  ): String = {
     val typeName = s"${structName}${paramsUse(params)}"
     if (fieldNames.isEmpty) {
       s"({} : ${typeName})"
     } else {
-      val args = fieldNames.map(n => s"${n} := ${stateName}.${n}").mkString("{ ", ", ", " }")
+      val args = fieldNames.map { case (field, from) => s"${field} := ${stateName}.${from}" }
+        .mkString("{ ", ", ", " }")
       s"(${args} : ${typeName})"
     }
   }
 
-  private def applyStatementsCL(body: List[MStatement], startState: String): (String, CodeLines) = {
+  private def applyStatementsCL(
+      body: List[MStatement],
+      startState: String,
+      stateType: Option[String]
+  ): (String, CodeLines) = {
     val statements = body.filterNot {
       case _: IoDef  => true
       case _: RegDef => true
-      case _: WireDef => true
-      case _: SValDef => true
-      case _: SDefDef => true
-      case _: EnumDef => true
-      case _: SUnapplyDef => true
       case _: SubModuleDef => true
       case _ => false
     }
@@ -256,7 +404,7 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     val lines = statements.map { stmt =>
       idx += 1
       val nextState = s"st${idx}"
-      val cl = statementToStateUpdate(stmt, curState, nextState)
+      val cl = statementToStateUpdate(stmt, curState, nextState, stateType)
       curState = nextState
       cl
     }.toCodeLines
@@ -264,21 +412,69 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     (curState, lines)
   }
 
-  private def statementToStateUpdate(stmt: MStatement, fromState: String, toState: String): CodeLines = {
+  private def statementToStateUpdate(
+      stmt: MStatement,
+      fromState: String,
+      toState: String,
+      stateType: Option[String]
+  ): CodeLines = {
+    val stateAnnot = stateType.map(t => s": ${t}").getOrElse("")
     stmt match {
       case c: Connect =>
+        (c.left, c.expr) match {
+          case (leftRef: SignalRef, rightRef: SignalRef) =>
+            leftRef.tpe match {
+              case lBundle: Bundle =>
+                rightRef.tpe match {
+                  case rBundle: Bundle =>
+                    val leftBase = signalBaseName(leftRef.name)
+                    val rightBase = signalBaseName(rightRef.name)
+                    val leftFields = lBundle.flatten(leftBase)
+                    val rightFields = rBundle.flatten(rightBase)
+                    val rightMap = rightFields.map { case (name, tpe) =>
+                      val suffix = if (name.startsWith(rightBase + "_")) name.substring(rightBase.length + 1) else name
+                      suffix -> (name, tpe)
+                    }.toMap
+                    var lastState = fromState
+                    val updates = leftFields.map { case (lname, ltpe) =>
+                      val suffix = if (lname.startsWith(leftBase + "_")) lname.substring(leftBase.length + 1) else lname
+                      val fieldName = if (leftRef.tpe.isReg) s"${lname}_next" else lname
+                      val rhs = rightMap.get(suffix) match {
+                        case Some((rname, rtpe)) =>
+                          if (rtpe.isInput) s"inputs.${rname}"
+                          else if (rtpe.isReg) s"regs.${rname}"
+                          else s"${fromState}.${rname}"
+                        case None =>
+                          mTypeDefault(ltpe)
+                      }
+                      val nextState = s"${toState}_${fieldName}"
+                    val update = s"let ${nextState} ${stateAnnot} := { ${lastState} with ${fieldName} := ${rhs} }"
+                    lastState = nextState
+                    CodeLines(update)
+                  }.toCodeLines
+                  return CodeLines(
+                    updates,
+                    s"let ${toState} ${stateAnnot} := ${lastState}"
+                  )
+                  case _ =>
+                }
+              case _ =>
+            }
+          case _ =>
+        }
         c.left match {
           case CApply(VecSelect, _, operands) if operands.length >= 2 =>
             val vecName = mTermToLean(operands.head, fromState, leftSide = true)
-            val idxExpr = mTermToLean(operands.tail.head, fromState, leftSide = false)
+            val idxExpr = termToNat(operands.tail.head, fromState)
             val leftWidth = signalWidthFromTerm(c.left)
             val rightExpr = c.expr match {
               case l: Lit => litLeanWithWidth(l, leftWidth)
               case _      => mTermToLean(c.expr, fromState, leftSide = false)
             }
-            val currentVec = s"${fromState}.${vecName}"
-            val updateExpr = s"vecUpdate ${currentVec} (${idxExpr}).toNat ${rightExpr}"
-            CodeLines(s"let ${toState} := { ${fromState} with ${vecName} := ${updateExpr} }")
+            val currentVec =
+              if (vecName.contains(".")) vecName else s"${fromState}.${vecName}"
+            val updateExpr = s"vecUpdate ${currentVec} ${idxExpr} ${rightExpr}"
+            CodeLines(s"let ${toState} ${stateAnnot} := { ${fromState} with ${vecName} := ${updateExpr} }")
           case _ =>
             val leftName = mTermToLean(c.left, fromState, leftSide = true)
             val leftWidth = signalWidthFromTerm(c.left)
@@ -286,14 +482,27 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
               case l: Lit => litLeanWithWidth(l, leftWidth)
               case _      => mTermToLean(c.expr, fromState, leftSide = false)
             }
-            CodeLines(s"let ${toState} := { ${fromState} with ${leftName} := ${rightExpr} }")
+            val rightExprFixed = (c.left, rightExpr) match {
+              case (SignalRef(_, tpe: Vec), "0") => signalDefault(tpe)
+              case _ => rightExpr
+            }
+            val rhs =
+              leftWidth match {
+                case Some(w) if rightExprFixed.matches("-?\\d+") =>
+                  s"(BitVec.ofNat (${w}) (${rightExprFixed}))"
+                case Some(w) if termIsBitVec(c.expr) => s"bvCast (${rightExprFixed}) ${wrapIfNeeded(w)}"
+                case _                                => rightExprFixed
+              }
+            CodeLines(s"let ${toState} ${stateAnnot} := { ${fromState} with ${leftName} := ${rhs} }")
         }
       case w: When =>
         val cond = mTermToLean(w.cond, fromState, leftSide = false)
-        val whenExpr = branchExpr(w.whenp, fromState, s"${toState}w")
-        val otherExpr = if (w.otherp.isEmpty) CodeLines(fromState) else branchExpr(w.otherp, fromState, s"${toState}o")
+        val whenExpr = branchExpr(w.whenp, fromState, s"${toState}w", stateType)
+        val otherExpr =
+          if (w.otherp.isEmpty) CodeLines(fromState)
+          else branchExpr(w.otherp, fromState, s"${toState}o", stateType)
         CodeLines(
-          s"let ${toState} := if bv1IsTrue (${cond}) then",
+          s"let ${toState} ${stateAnnot} := if bv1IsTrue (${cond}) then",
           whenExpr.indented,
           s"else",
           otherExpr.indented
@@ -302,7 +511,7 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
         val cond = mTermToLean(s.cond, fromState, leftSide = false)
         val branches = s.branchs.zipWithIndex.map { case ((v, body), i) =>
           val vExpr = mTermToLean(v, fromState, leftSide = false)
-          val bExpr = branchExpr(body, fromState, s"${toState}b${i}")
+          val bExpr = branchExpr(body, fromState, s"${toState}b${i}", stateType)
           CodeLines(
             s"if (${cond} == ${vExpr}) then",
             bExpr.indented,
@@ -314,30 +523,243 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
           CodeLines(cl, acc.indented)
         }
         CodeLines(
-          s"let ${toState} :=",
+          s"let ${toState} ${stateAnnot} :=",
           expr.indented
         )
       case n: NodeDef =>
-        val rhs = mTermToLean(n.rhs, fromState, leftSide = false)
-        CodeLines(s"let ${toState} := { ${fromState} with ${n.name.toString()} := ${rhs} }")
+        val rhsExpr = mTermToLean(n.rhs, fromState, leftSide = false)
+        val rhs =
+          signalWidthFromType(n.tpe) match {
+            case Some(w) if rhsExpr.matches("-?\\d+") =>
+              s"(BitVec.ofNat (${w}) (${rhsExpr}))"
+            case Some(w) if termIsBitVec(n.rhs) => s"bvCast (${rhsExpr}) ${wrapIfNeeded(w)}"
+            case _                              => rhsExpr
+          }
+        CodeLines(s"let ${toState} ${stateAnnot} := { ${fromState} with ${n.name.toString()} := ${rhs} }")
+      case w: WireDef =>
+        val rhsExpr = w.someInit.map(mTermToLean(_, fromState, leftSide = false)).getOrElse(signalDefault(w.tpe))
+        val rhs =
+          signalWidthFromType(w.tpe) match {
+            case Some(width) if rhsExpr.matches("-?\\d+") =>
+              s"(BitVec.ofNat (${width}) (${rhsExpr}))"
+            case Some(width) if w.someInit.exists(termIsBitVec) =>
+              s"bvCast (${rhsExpr}) ${wrapIfNeeded(width)}"
+            case _                                              => rhsExpr
+          }
+        CodeLines(s"let ${toState} ${stateAnnot} := { ${fromState} with ${w.name.toString()} := ${rhs} }")
       case s: SubModuleRun =>
-        subModuleRunCL(s, fromState, toState)
+        subModuleRunCL(s, fromState, toState, stateType)
+      case s: SValDef =>
+        val rhs = mTermToLean(s.rhs, fromState, leftSide = false)
+        CodeLines(
+          s"let ${s.name.toString()} : ${mTypeToLean(s.tpe)} := ${rhs}",
+          s"let ${toState} ${stateAnnot} := ${fromState}"
+        )
+      case s: SUnapplyDef =>
+        val names = s.names.map(_.toString())
+        val rhs = s.rhs
+        val lets = rhs match {
+          case STuple(args, _) if args.length == names.length =>
+            names.zip(args).map { case (n, t) =>
+              s"let ${n} := ${mTermToLean(t, fromState, leftSide = false)}"
+            }
+          case _ =>
+            List(s"let (${names.mkString(", ")}) := ${mTermToLean(rhs, fromState, leftSide = false)}")
+        }
+        CodeLines(
+          lets.toCodeLines,
+          s"let ${toState} ${stateAnnot} := ${fromState}"
+        )
+      case s: SDefDef =>
+        val paramNames = s.vparamss.flatten.map(_.name.toString())
+        val usedNames = scala.collection.mutable.Set[String]() ++ moduleParamNames
+        def uniqueParamName(base: String): String = {
+          if (!usedNames.contains(base)) {
+            usedNames += base
+            base
+          } else {
+            var idx = 1
+            var cand = s"${base}_arg"
+            while (usedNames.contains(cand)) {
+              idx += 1
+              cand = s"${base}_arg${idx}"
+            }
+            usedNames += cand
+            cand
+          }
+        }
+        val paramRenameMap = s.vparamss.flatten.map { vp =>
+          val raw = leanIdent(vp.name.toString())
+          val renamed = uniqueParamName(raw)
+          raw -> renamed
+        }.toMap
+        val paramBindingTypes = s.vparamss.flatten.map { vp =>
+          val raw = leanIdent(vp.name.toString())
+          paramRenameMap.getOrElse(raw, raw) -> vp.tpe
+        }
+        val paramTypePairs = s.vparamss.flatten.map { vp =>
+          val raw = leanIdent(vp.name.toString())
+          val leanName = paramRenameMap.getOrElse(raw, raw)
+          val paramType = vp.tpe match {
+            case UInt(width, _, _) if isInferredWidth(width) && raw.toLowerCase().contains("dw") =>
+              "BitVec 1"
+            case SInt(width, _, _) if isInferredWidth(width) && raw.toLowerCase().contains("dw") =>
+              "BitVec 1"
+            case _ =>
+              mTypeToLeanForParam(vp.tpe)
+          }
+          (leanName, paramType)
+        }
+        val params = paramTypePairs.map { case (leanName, paramType) =>
+          s"(${leanName} : ${paramType})"
+        }.mkString(" ")
+        val paramTypes = paramTypePairs.map(_._2)
+        val (retTypeRaw, retDefaultRaw) = defReturnTypeAndDefault(s, paramNames)
+        val natParam = paramTypePairs.find(_._2 == "Nat").map(_._1)
+        val bitVecParamWidth = paramTypePairs
+          .flatMap { case (_, tpe) => bitVecWidthFromTypeString(tpe).toList }
+          .headOption
+        val retWidthFallback = natParam.orElse(bitVecParamWidth)
+        val retType = s.tpe match {
+          case UInt(width, _, _) if isInferredWidth(width) =>
+            natParam
+              .map(n => s"BitVec ${n}")
+              .orElse(bitVecParamWidth.map(w => s"BitVec ${w}"))
+              .getOrElse(retTypeRaw)
+          case SInt(width, _, _) if isInferredWidth(width) =>
+            natParam
+              .map(n => s"BitVec ${n}")
+              .orElse(bitVecParamWidth.map(w => s"BitVec ${w}"))
+              .getOrElse(retTypeRaw)
+          case _ =>
+            retWidthFallback
+              .map(w => mTypeToLeanWithFallback(s.tpe, Some(w)))
+              .getOrElse(retTypeRaw)
+        }
+        val retDefault = s.tpe match {
+          case UInt(width, _, _) if isInferredWidth(width) =>
+            natParam
+              .map(n => s"(BitVec.ofNat ${n} 0)")
+              .orElse(bitVecParamWidth.map(w => s"(BitVec.ofNat ${w} 0)"))
+              .getOrElse(retDefaultRaw)
+          case SInt(width, _, _) if isInferredWidth(width) =>
+            natParam
+              .map(n => s"(BitVec.ofNat ${n} 0)")
+              .orElse(bitVecParamWidth.map(w => s"(BitVec.ofNat ${w} 0)"))
+              .getOrElse(retDefaultRaw)
+          case _ => retDefaultRaw
+        }
+        val typeSig = paramTypePairs.foldRight(retType) { case ((name, tpe), acc) =>
+          s"(${name} : ${tpe}) → ${acc}"
+        }
+        val savedBindings = localBindings
+        val savedBindingTypes = localBindingTypes
+        val savedNatParam = currentNatParam
+        val savedBitVecParamWidth = currentBitVecParamWidth
+        val savedRenames = localRenames
+        val localNames = defBodyLocalNames(s.defp)
+        val localTypes = defBodyLocalTypes(s.defp)
+        localBindings = localBindings ++ paramTypePairs.map(_._1) ++ localNames
+        localBindingTypes = localBindingTypes ++ paramBindingTypes ++ localTypes
+        localRenames = localRenames ++ paramRenameMap
+        currentNatParam = natParam
+        currentBitVecParamWidth = bitVecParamWidth
+        val bodyTermOpt = defBodyTermOpt(s.defp)
+        val rawBody = defBodyExpr(s.defp, fromState)
+        localBindings = savedBindings
+        localBindingTypes = savedBindingTypes
+        currentNatParam = savedNatParam
+        currentBitVecParamWidth = savedBitVecParamWidth
+        localRenames = savedRenames
+        val bodyExpr = s.tpe match {
+          case sig: SignalType =>
+            val width = sig match {
+              case UInt(w, _, _) if isInferredWidth(w) =>
+                natParam.orElse(bitVecParamWidth).getOrElse(widthToLean(w))
+              case SInt(w, _, _) if isInferredWidth(w) =>
+                natParam.orElse(bitVecParamWidth).getOrElse(widthToLean(w))
+              case _ =>
+                signalWidthFromType(sig).getOrElse("1")
+            }
+            if (rawBody.matches("-?\\d+")) s"(BitVec.ofNat (${width}) (${rawBody}))"
+            else if (bodyTermOpt.exists(termIsBitVec)) s"bvCast (${rawBody}) ${wrapIfNeeded(width)}"
+            else rawBody
+          case _ => rawBody
+        }
+        val needsWrapper = natParam.exists { n =>
+          val isInferred = s.tpe match {
+            case UInt(w, _, _) if isInferredWidth(w) => true
+            case SInt(w, _, _) if isInferredWidth(w) => true
+            case _ => false
+          }
+          isInferred && paramTypePairs.nonEmpty && paramTypePairs.head._1 != n
+        }
+        val defLines =
+          if (needsWrapper) {
+            val natName = natParam.get
+            val implParamPairs = (paramTypePairs.find(_._1 == natName).toList) ++ paramTypePairs.filterNot(_._1 == natName)
+            val implParams = implParamPairs.map { case (leanName, paramType) =>
+              s"(${leanName} : ${paramType})"
+            }.mkString(" ")
+            val typeSigImpl = implParamPairs.foldRight(retType) { case ((name, tpe), acc) =>
+              s"(${name} : ${tpe}) → ${acc}"
+            }
+            val implName = s"${s.name.toString()}_impl"
+            val implLine =
+              if (implParams.isEmpty)
+                s"let ${implName} : ${retType} := ${bodyExpr}"
+              else
+                s"let ${implName} : ${typeSigImpl} := fun ${implParams} => ${bodyExpr}"
+            val wrapperLine =
+              if (params.isEmpty)
+                s"let ${s.name.toString()} : ${retType} := ${implName}"
+              else {
+                val implArgs = implParamPairs.map(_._1).mkString(" ")
+                s"let ${s.name.toString()} : ${typeSig} := fun ${params} => ${implName} ${implArgs}"
+              }
+            CodeLines(implLine, wrapperLine)
+          } else {
+            val defLine =
+              if (params.isEmpty)
+                s"let ${s.name.toString()} : ${retType} := ${bodyExpr}"
+              else
+                s"let ${s.name.toString()} : ${typeSig} := fun ${params} => ${bodyExpr}"
+            CodeLines(defLine)
+          }
+        CodeLines(
+          defLines,
+          s"let ${toState} ${stateAnnot} := ${fromState}"
+        )
+      case e: EnumDef =>
+        val width = widthToLean(e.tpe.width)
+        val lets = e.names.zipWithIndex.map { case (n, idx) =>
+          s"let ${n.toString()} := (BitVec.ofNat ${width} ${idx})"
+        }
+        CodeLines(
+          lets.toCodeLines,
+          s"let ${toState} ${stateAnnot} := ${fromState}"
+        )
       case _ =>
-        CodeLines(s"let ${toState} := ${fromState}")
+        CodeLines(s"let ${toState} ${stateAnnot} := ${fromState}")
     }
   }
 
-  private def branchExpr(stmt: MStatement, stateName: String, prefix: String): CodeLines = {
+  private def branchExpr(
+      stmt: MStatement,
+      stateName: String,
+      prefix: String,
+      stateType: Option[String]
+  ): CodeLines = {
     stmt match {
       case s: SBlock =>
-        val (finalState, updates) = applyStatementsCL(s.body, stateName)
+        val (finalState, updates) = applyStatementsCL(s.body, stateName, stateType)
         CodeLines(
           updates,
           finalState
         )
       case x =>
         val tmpState = s"${prefix}1"
-        val update = statementToStateUpdate(x, stateName, tmpState)
+        val update = statementToStateUpdate(x, stateName, tmpState, stateType)
         CodeLines(
           update,
           tmpState
@@ -347,15 +769,30 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
 
   private def signalTypeToLean(tpe: SignalType): String = tpe match {
     case Bool(_, _) => "BitVec 1"
-    case UInt(width, _, _) => s"BitVec ${widthToLean(width)}"
-    case SInt(width, _, _) => s"BitVec ${widthToLean(width)}"
-    case Vec(_, _, tparam) => s"List ${signalTypeToLean(tparam)}"
+    case UInt(width, _, _) => s"BitVec (${widthToLean(width)})"
+    case SInt(width, _, _) => s"BitVec (${widthToLean(width)})"
+    case Vec(_, _, tparam) => s"List (${signalTypeToLean(tparam)})"
+    case _ => "BitVec 1"
+  }
+
+  private def signalTypeToLeanForParam(tpe: SignalType): String = tpe match {
+    case Bool(_, _) => "BitVec 1"
+    case UInt(width, _, _) => s"BitVec (${widthToLeanForParam(width)})"
+    case SInt(width, _, _) => s"BitVec (${widthToLeanForParam(width)})"
+    case Vec(_, _, tparam) => s"List (${signalTypeToLeanForParam(tparam)})"
     case _ => "BitVec 1"
   }
 
   private def widthToLean(width: CSize): String = width match {
     case KnownSize(w) => sTermToLean(w)
-    case _ => "1"
+    case InferredSize => "1"
+    case UnknownSize  => "1"
+  }
+
+  private def widthToLeanForParam(width: CSize): String = width match {
+    case KnownSize(w) => sTermToLean(w)
+    case InferredSize => defaultWidthParam.getOrElse("1")
+    case UnknownSize  => defaultWidthParam.getOrElse("1")
   }
 
   private def sTypeToLean(tpe: SType): String = tpe match {
@@ -363,14 +800,17 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     case StBigInt => "Nat"
     case StBoolean => "Bool"
     case StUnit => "Unit"
+    case StTuple(tparams) => tparams.map(mTypeToLean).mkString(" × ")
+    case StSeq(tparam) => s"List (${mTypeToLean(tparam)})"
+    case StArray(tparam) => s"List (${mTypeToLean(tparam)})"
     case _ => "Nat"
   }
 
   private def signalDefault(tpe: SignalType): String = tpe match {
     case Bool(_, _) => "(BitVec.ofNat 1 0)"
-    case UInt(width, _, _) => s"(BitVec.ofNat ${widthToLean(width)} 0)"
-    case SInt(width, _, _) => s"(BitVec.ofNat ${widthToLean(width)} 0)"
-    case Vec(size, _, tparam) => s"List.replicate ${widthToLean(size)} ${signalDefault(tparam)}"
+    case UInt(width, _, _) => s"(BitVec.ofNat (${widthToLean(width)}) 0)"
+    case SInt(width, _, _) => s"(BitVec.ofNat (${widthToLean(width)}) 0)"
+    case Vec(size, _, tparam) => s"List.replicate (${widthToLean(size)}) ${signalDefault(tparam)}"
     case _ => "0"
   }
 
@@ -383,23 +823,103 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     case s: SSelect => sSelectLean(s, stateName)
     case s: STuple => s"(${s.args.map(mTermToLean(_, stateName, leftSide = false)).mkString(", ")})"
     case s: SLiteral => sLiteralLean(s)
-    case SIdent(name, _) => name.toString()
-    case s: SIf => s"(if ${mTermToLean(s.cond, stateName, leftSide = false)} then ${mTermToLean(s.thenp, stateName, leftSide = false)} else ${mTermToLean(s.elsep, stateName, leftSide = false)})"
-    case s: SBlock => ""
-    case s: SAssign => ""
+    case SIdent(name, _) =>
+      val raw = leanIdent(name.toString())
+      localRenames.getOrElse(raw, raw)
+    case s: SFunction =>
+      val usedNames = scala.collection.mutable.Set[String]() ++ moduleParamNames
+      def uniqueLambdaName(base: String): String = {
+        if (!usedNames.contains(base)) {
+          usedNames += base
+          base
+        } else {
+          var idx = 1
+          var cand = s"${base}_arg"
+          while (usedNames.contains(cand)) {
+            idx += 1
+            cand = s"${base}_arg${idx}"
+          }
+          usedNames += cand
+          cand
+        }
+      }
+      val paramRenameMap = s.vparams.map { vp =>
+        val raw = leanIdent(vp.name.toString())
+        raw -> uniqueLambdaName(raw)
+      }.toMap
+      val params = s.vparams.map { vp =>
+        val raw = leanIdent(vp.name.toString())
+        val leanName = paramRenameMap.getOrElse(raw, raw)
+        s"(${leanName} : ${mTypeToLean(vp.tpe)})"
+      }.mkString(" ")
+      val savedBindings = localBindings
+      val savedBindingTypes = localBindingTypes
+      val savedRenames = localRenames
+      val paramNames = s.vparams.map(vp => paramRenameMap.getOrElse(leanIdent(vp.name.toString()), leanIdent(vp.name.toString())))
+      val paramTypes = s.vparams.map(vp => paramRenameMap.getOrElse(leanIdent(vp.name.toString()), leanIdent(vp.name.toString())) -> vp.tpe)
+      localBindings = localBindings ++ paramNames
+      localBindingTypes = localBindingTypes ++ paramTypes
+      localRenames = localRenames ++ paramRenameMap
+      val body = mTermToLean(s.funcp, stateName, leftSide = false)
+      localBindings = savedBindings
+      localBindingTypes = savedBindingTypes
+      localRenames = savedRenames
+      s"(fun ${params} => ${body})"
+    case s: SIf =>
+      val cond = mTermToLean(s.cond, stateName, leftSide = false)
+      val thenExprRaw = mTermToLean(s.thenp, stateName, leftSide = false)
+      val elseExprRaw = mTermToLean(s.elsep, stateName, leftSide = false)
+      val (thenExpr, elseExpr) = s.tpe match {
+        case sig: SignalType =>
+          val width = sig match {
+            case UInt(w, _, _) if isInferredWidth(w) =>
+              termWidthWithState(s.thenp, stateName)
+                .orElse(termWidthWithState(s.elsep, stateName))
+                .orElse(currentNatParam)
+                .orElse(currentBitVecParamWidth)
+                .getOrElse("1")
+            case SInt(w, _, _) if isInferredWidth(w) =>
+              termWidthWithState(s.thenp, stateName)
+                .orElse(termWidthWithState(s.elsep, stateName))
+                .orElse(currentNatParam)
+                .orElse(currentBitVecParamWidth)
+                .getOrElse("1")
+            case _ =>
+              signalWidthFromType(sig).getOrElse("1")
+          }
+          val tExpr =
+            if (thenExprRaw.matches("-?\\d+")) s"(BitVec.ofNat (${width}) (${thenExprRaw}))"
+            else if (termIsBitVec(s.thenp)) s"bvCast (${thenExprRaw}) ${wrapIfNeeded(width)}"
+            else thenExprRaw
+          val eExpr =
+            if (elseExprRaw.matches("-?\\d+")) s"(BitVec.ofNat (${width}) (${elseExprRaw}))"
+            else if (termIsBitVec(s.elsep)) s"bvCast (${elseExprRaw}) ${wrapIfNeeded(width)}"
+            else elseExprRaw
+          (tExpr, eExpr)
+        case StSeq(_) | StArray(_) =>
+          val tExpr = if (thenExprRaw == "0") "[]" else thenExprRaw
+          val eExpr = if (elseExprRaw == "0") "[]" else elseExprRaw
+          (tExpr, eExpr)
+        case _ =>
+          (thenExprRaw, elseExprRaw)
+      }
+      s"(if ${cond} then ${thenExpr} else ${elseExpr})"
+    case s: SBlock =>
+      val last = s.body.lastOption
+      last match {
+        case Some(m: MTerm) => mTermToLean(m, stateName, leftSide = false)
+        case _ => "0"
+      }
+    case s: SAssign => "0"
     case EmptyMTerm => ""
     case _ => "0"
   }
 
   private def signalRefLean(signalRef: SignalRef, stateName: String, leftSide: Boolean): String = {
-    def getNameFromTree(tree: Tree): String = tree match {
-      case Ident(name)             => name.toString()
-      case Select(This(_), name)   => name.toString()
-      case Select(qualifier, name) => s"${getNameFromTree(qualifier)}_${name}"
-      case _ => "unknown"
-    }
-    val baseName = getNameFromTree(signalRef.name)
-    if (signalRef.tpe.isReg) {
+    val baseName = leanIdent(signalBaseName(signalRef.name))
+    if (localBindings.contains(baseName)) {
+      baseName
+    } else if (signalRef.tpe.isReg) {
       if (leftSide) s"${baseName}_next" else s"regs.${baseName}"
     } else if (signalRef.tpe.isInput) {
       s"inputs.${baseName}"
@@ -410,77 +930,380 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     }
   }
 
+  private def signalBaseName(tree: Tree): String = tree match {
+    case Ident(name)             => leanIdent(name.toString())
+    case Select(This(_), name)   => leanIdent(name.toString())
+    case Select(qualifier, name) => s"${signalBaseName(qualifier)}_${leanIdent(name.toString())}"
+    case _ => "unknown"
+  }
+
   private def cApplyLean(cApply: CApply, stateName: String): String = {
     val operands = cApply.operands.map(mTermToLean(_, stateName, leftSide = false))
     cApply.op match {
       case VecSelect =>
-        if (operands.length >= 2) s"vecSelect ${operands(0)} (${operands(1)}).toNat"
+        if (operands.length >= 2) {
+          val idxExpr = termToNat(cApply.operands(1), stateName)
+          val baseType = termSignalType(cApply.operands.head)
+          baseType match {
+            case Some(_: Vec) =>
+              s"vecSelect ${operands(0)} ${idxExpr}"
+            case _ =>
+              s"bvSlice ${operands(0)} ${idxExpr} ${idxExpr}"
+          }
+        }
         else "0"
-      case Add => s"(${operands(0)} + ${operands(1)})"
-      case Minus => s"(${operands(0)} - ${operands(1)})"
-      case Multiply => s"(${operands(0)} * ${operands(1)})"
-      case And => s"(${operands(0)} &&& ${operands(1)})"
-      case Or => s"(${operands(0)} ||| ${operands(1)})"
-      case Xor => s"(${operands(0)} ^^^ ${operands(1)})"
-      case LShift => s"(${operands(0)} <<< ${operands(1)})"
-      case RShift => s"(${operands(0)} >>> ${operands(1)})"
-      case Equal => s"boolToBv1 (${operands(0)} = ${operands(1)})"
-      case NotEqual => s"boolToBv1 (${operands(0)} != ${operands(1)})"
-      case GreaterEq => s"boolToBv1 (${operands(0)} >= ${operands(1)})"
-      case LogiAnd => s"(${operands(0)} &&& ${operands(1)})"
-      case LogiOr => s"(${operands(0)} ||| ${operands(1)})"
+      case Add =>
+        val lhs = cApply.operands(0)
+        val rhs = cApply.operands(1)
+        val lhsExpr = operands(0)
+        val rhsExpr = operands(1)
+        val outWidth = signalWidthFromType(cApply.tpe)
+        val lhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(lhs) && !lhsExpr.matches("-?\\d+") =>
+            s"bvCast (${lhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => lhsExpr
+        }
+        val rhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(rhs) && !rhsExpr.matches("-?\\d+") =>
+            s"bvCast (${rhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => rhsExpr
+        }
+        s"(${lhsFixed} + ${rhsFixed})"
+      case Minus =>
+        val lhs = cApply.operands(0)
+        val rhs = cApply.operands(1)
+        val lhsExpr = operands(0)
+        val rhsExpr = operands(1)
+        val outWidth = signalWidthFromType(cApply.tpe)
+        val lhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(lhs) && !lhsExpr.matches("-?\\d+") =>
+            s"bvCast (${lhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => lhsExpr
+        }
+        val rhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(rhs) && !rhsExpr.matches("-?\\d+") =>
+            s"bvCast (${rhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => rhsExpr
+        }
+        s"(${lhsFixed} - ${rhsFixed})"
+      case Multiply =>
+        val lhs = cApply.operands(0)
+        val rhs = cApply.operands(1)
+        val lhsExpr = operands(0)
+        val rhsExpr = operands(1)
+        val outWidth = signalWidthFromType(cApply.tpe)
+        val lhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(lhs) && !lhsExpr.matches("-?\\d+") =>
+            s"bvCast (${lhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => lhsExpr
+        }
+        val rhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(rhs) && !rhsExpr.matches("-?\\d+") =>
+            s"bvCast (${rhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => rhsExpr
+        }
+        s"(${lhsFixed} * ${rhsFixed})"
+      case And =>
+        val lhs = cApply.operands(0)
+        val rhs = cApply.operands(1)
+        val lhsExpr = operands(0)
+        val rhsExpr = operands(1)
+        val outWidth = signalWidthFromType(cApply.tpe)
+        val lhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(lhs) && !lhsExpr.matches("-?\\d+") =>
+            s"bvCast (${lhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => lhsExpr
+        }
+        val rhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(rhs) && !rhsExpr.matches("-?\\d+") =>
+            s"bvCast (${rhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => rhsExpr
+        }
+        s"(${lhsFixed} &&& ${rhsFixed})"
+      case Or =>
+        val lhs = cApply.operands(0)
+        val rhs = cApply.operands(1)
+        val lhsExpr = operands(0)
+        val rhsExpr = operands(1)
+        val outWidth = signalWidthFromType(cApply.tpe)
+        val lhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(lhs) && !lhsExpr.matches("-?\\d+") =>
+            s"bvCast (${lhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => lhsExpr
+        }
+        val rhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(rhs) && !rhsExpr.matches("-?\\d+") =>
+            s"bvCast (${rhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => rhsExpr
+        }
+        s"(${lhsFixed} ||| ${rhsFixed})"
+      case Xor =>
+        val lhs = cApply.operands(0)
+        val rhs = cApply.operands(1)
+        val lhsExpr = operands(0)
+        val rhsExpr = operands(1)
+        val outWidth = signalWidthFromType(cApply.tpe)
+        val lhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(lhs) && !lhsExpr.matches("-?\\d+") =>
+            s"bvCast (${lhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => lhsExpr
+        }
+        val rhsFixed = outWidth match {
+          case Some(w) if termIsBitVec(rhs) && !rhsExpr.matches("-?\\d+") =>
+            s"bvCast (${rhsExpr}) ${wrapIfNeeded(w)}"
+          case _ => rhsExpr
+        }
+        s"(${lhsFixed} ^^^ ${rhsFixed})"
+      case LShift => s"(${operands(0)} <<< ${termToNat(cApply.operands(1), stateName)})"
+      case RShift => s"(${operands(0)} >>> ${termToNat(cApply.operands(1), stateName)})"
+      case Equal =>
+        s"boolToBv1 (${termToNat(cApply.operands(0), stateName)} = ${termToNat(cApply.operands(1), stateName)})"
+      case NotEqual =>
+        s"boolToBv1 (${termToNat(cApply.operands(0), stateName)} != ${termToNat(cApply.operands(1), stateName)})"
+      case GreaterEq =>
+        s"boolToBv1 (${termToNat(cApply.operands(0), stateName)} >= ${termToNat(cApply.operands(1), stateName)})"
+      case LogiAnd =>
+        val widthOpt = cApply.tpe match {
+          case UInt(w, _, _) if isInferredWidth(w) =>
+            termWidthWithState(cApply.operands(0), stateName)
+              .orElse(termWidthWithState(cApply.operands(1), stateName))
+          case SInt(w, _, _) if isInferredWidth(w) =>
+            termWidthWithState(cApply.operands(0), stateName)
+              .orElse(termWidthWithState(cApply.operands(1), stateName))
+          case _ =>
+            signalWidthFromType(cApply.tpe)
+        }
+        val lhs = widthOpt match {
+          case Some(w) if termIsBitVec(cApply.operands(0)) => s"bvCast (${operands(0)}) ${wrapIfNeeded(w)}"
+          case _ => operands(0)
+        }
+        val rhs = widthOpt match {
+          case Some(w) if termIsBitVec(cApply.operands(1)) => s"bvCast (${operands(1)}) ${wrapIfNeeded(w)}"
+          case _ => operands(1)
+        }
+        s"(${lhs} &&& ${rhs})"
+      case LogiOr =>
+        val widthOpt = cApply.tpe match {
+          case UInt(w, _, _) if isInferredWidth(w) =>
+            termWidthWithState(cApply.operands(0), stateName)
+              .orElse(termWidthWithState(cApply.operands(1), stateName))
+          case SInt(w, _, _) if isInferredWidth(w) =>
+            termWidthWithState(cApply.operands(0), stateName)
+              .orElse(termWidthWithState(cApply.operands(1), stateName))
+          case _ =>
+            signalWidthFromType(cApply.tpe)
+        }
+        val lhs = widthOpt match {
+          case Some(w) if termIsBitVec(cApply.operands(0)) => s"bvCast (${operands(0)}) ${wrapIfNeeded(w)}"
+          case _ => operands(0)
+        }
+        val rhs = widthOpt match {
+          case Some(w) if termIsBitVec(cApply.operands(1)) => s"bvCast (${operands(1)}) ${wrapIfNeeded(w)}"
+          case _ => operands(1)
+        }
+        s"(${lhs} ||| ${rhs})"
       case LogiNot => s"(~~~${operands(0)})"
       case Not => s"(~~~${operands(0)})"
       case Negative => s"(-${operands(0)})"
-      case Mux => s"(if bv1IsTrue (${operands(0)}) then ${operands(1)} else ${operands(2)})"
+      case Mux =>
+        val width1 = termWidthWithState(cApply.operands(1), stateName)
+        val width2 = termWidthWithState(cApply.operands(2), stateName)
+        val operandWidth = (width1, width2) match {
+          case (Some("1"), Some(w)) if w != "1" => Some(w)
+          case (Some(w), Some("1")) if w != "1" => Some(w)
+          case (Some(w), _) => Some(w)
+          case (None, Some(w)) => Some(w)
+          case _ => None
+        }
+        val outWidthRaw = cApply.tpe match {
+          case UInt(w, _, _) if isInferredWidth(w) =>
+            operandWidth
+              .orElse(currentNatParam)
+              .orElse(currentBitVecParamWidth)
+          case SInt(w, _, _) if isInferredWidth(w) =>
+            operandWidth
+              .orElse(currentNatParam)
+              .orElse(currentBitVecParamWidth)
+          case _ =>
+            signalWidthFromType(cApply.tpe)
+        }
+        val outWidth = outWidthRaw match {
+          case Some("1") =>
+            operandWidth.filter(_ != "1")
+              .orElse(currentBitVecParamWidth)
+              .orElse(outWidthRaw)
+          case _ => outWidthRaw
+        }
+        val thenExpr = outWidth match {
+          case Some(w) if operands(1).matches("-?\\d+") =>
+            s"(BitVec.ofNat (${w}) (${operands(1)}))"
+          case Some(w) if termIsBitVec(cApply.operands(1)) =>
+            s"bvCast (${operands(1)}) ${wrapIfNeeded(w)}"
+          case _ => operands(1)
+        }
+        val elseExpr = outWidth match {
+          case Some(w) if operands(2).matches("-?\\d+") =>
+            s"(BitVec.ofNat (${w}) (${operands(2)}))"
+          case Some(w) if termIsBitVec(cApply.operands(2)) =>
+            s"bvCast (${operands(2)}) ${wrapIfNeeded(w)}"
+          case _ => operands(2)
+        }
+        s"(if bv1IsTrue (${operands(0)}) then ${thenExpr} else ${elseExpr})"
       case Cat =>
         if (operands.isEmpty) "0"
-        else operands.reduceLeft((a, b) => s"bvCat ${a} ${b}")
+        else {
+          val wrapped = operands.map(o => s"(${o})")
+          val catExpr = wrapped.reduceLeft((a, b) => s"(bvCat ${a} ${b})")
+          val outWidth = cApply.tpe match {
+            case UInt(w, _, _) if isInferredWidth(w) =>
+              currentNatParam
+                .orElse(currentBitVecParamWidth)
+                .orElse(termWidthWithState(cApply, stateName))
+            case SInt(w, _, _) if isInferredWidth(w) =>
+              currentNatParam
+                .orElse(currentBitVecParamWidth)
+                .orElse(termWidthWithState(cApply, stateName))
+            case _ =>
+              signalWidthFromType(cApply.tpe)
+          }
+          outWidth match {
+            case Some(w) => s"bvCast (${catExpr}) ${wrapIfNeeded(w)}"
+            case None => catExpr
+          }
+        }
+      case Fill =>
+        if (operands.length >= 2) {
+          val nExpr = termToNat(cApply.operands(0), stateName)
+          val bitExpr = operands(1)
+          s"(if bv1IsTrue (${bitExpr}) then (BitVec.ofNat (${nExpr}) ((Nat.pow 2 ${nExpr}) - 1)) else (BitVec.ofNat (${nExpr}) 0))"
+        } else "0"
       case Slice =>
-        if (operands.length >= 3) s"bvSlice ${operands(0)} (${operands(1)}).toNat (${operands(2)}).toNat"
-        else "0"
+        if (operands.length >= 3) {
+          val hiExpr = termToNat(cApply.operands(1), stateName)
+          val loExpr = termToNat(cApply.operands(2), stateName)
+          s"bvSlice ${operands(0)} ${hiExpr} ${loExpr}"
+        } else if (operands.length == 2) {
+          val idxExpr = termToNat(cApply.operands(1), stateName)
+          s"bvSlice ${operands(0)} ${idxExpr} ${idxExpr}"
+        } else {
+          "0"
+        }
       case _ => "0"
     }
   }
 
   private def litLean(lit: Lit): String = {
-    val literal = mTermToLean(lit.litExp, "st0", leftSide = false)
+    val literalOpt = lit.litExp match {
+      case SLiteral(value, StBoolean) => Some(if (value.toString() == "true") "1" else "0")
+      case SLiteral(value, StString)  => Some(stringLiteralToNat(value.toString()))
+      case _                          => None
+    }
     val width = lit.tpe match {
       case Bool(_, _) => "1"
       case UInt(w, _, _) => widthToLean(w)
       case SInt(w, _, _) => widthToLean(w)
     }
-    s"(BitVec.ofNat ${width} ${literal})"
+    literalOpt match {
+      case Some(literal) =>
+        if (literal.startsWith("-"))
+          s"(bvCast (bvOfInt (${width}) ${literal}) ${wrapIfNeeded(width)})"
+        else
+          s"(BitVec.ofNat (${width}) (${literal}))"
+      case None =>
+        lit.tpe match {
+          case Bool(_, _) =>
+            s"boolToBv1 ${mTermToLean(lit.litExp, "st0", leftSide = false)}"
+          case _ =>
+            val natExpr = termToNat(lit.litExp, "st0")
+            s"(BitVec.ofNat (${width}) (${natExpr}))"
+        }
+    }
   }
 
   private def litLeanWithWidth(lit: Lit, widthOpt: Option[String]): String = {
-    val literal = mTermToLean(lit.litExp, "st0", leftSide = false)
+    val literalOpt = lit.litExp match {
+      case SLiteral(value, StBoolean) => Some(if (value.toString() == "true") "1" else "0")
+      case SLiteral(value, StString)  => Some(stringLiteralToNat(value.toString()))
+      case _                          => None
+    }
     val width = lit.tpe match {
       case Bool(_, _) => "1"
       case UInt(w, _, _) => if (isInferredWidth(w)) widthOpt.getOrElse(widthToLean(w)) else widthToLean(w)
       case SInt(w, _, _) => if (isInferredWidth(w)) widthOpt.getOrElse(widthToLean(w)) else widthToLean(w)
     }
-    s"(BitVec.ofNat ${width} ${literal})"
+    literalOpt match {
+      case Some(literal) =>
+        if (literal.startsWith("-"))
+          s"(bvCast (bvOfInt (${width}) ${literal}) ${wrapIfNeeded(width)})"
+        else
+          s"(BitVec.ofNat (${width}) (${literal}))"
+      case None =>
+        lit.tpe match {
+          case Bool(_, _) =>
+            s"boolToBv1 ${mTermToLean(lit.litExp, "st0", leftSide = false)}"
+          case _ =>
+            val natExpr = termToNat(lit.litExp, "st0")
+            s"(BitVec.ofNat (${width}) (${natExpr}))"
+        }
+    }
   }
 
   private def sLiteralLean(sLiteral: SLiteral): String = sLiteral.tpe match {
     case StString => "\"\""
+    case StBoolean =>
+      if (sLiteral.value.toString() == "true") "true" else "false"
     case _ => sLiteral.value.toString()
   }
 
   private def sApplyLean(sApply: SApply, stateName: String): String = {
-    val args = sApply.args.map(mTermToLean(_, stateName, leftSide = false))
+    val args = sApply.args.map(mTermToLean(_, stateName, leftSide = false)).map(wrapIfNeeded)
     sApply.fun match {
       case SSelect(from, name, _) =>
         val fromStr = mTermToLean(from, stateName, leftSide = false)
-        val n = name.toString()
+        val n = translateOpName(name.toString())
         n match {
-          case "+" => s"(${fromStr} + ${args.head})"
-          case "-" => s"(${fromStr} - ${args.head})"
-          case "*" => s"(${fromStr} * ${args.head})"
-          case "/" => s"(${fromStr} / ${args.head})"
-          case "%" => s"(${fromStr} % ${args.head})"
-          case _ => s"(${fromStr} ${n} ${args.mkString(" ")})"
+          case n if n.startsWith("apply") =>
+            val baseType = termSignalType(from)
+            if (sApply.args.length >= 2) {
+              val hiExpr = termToNat(sApply.args.head, stateName)
+              val loExpr = termToNat(sApply.args(1), stateName)
+              s"bvSlice ${fromStr} ${hiExpr} ${loExpr}"
+            } else if (sApply.args.nonEmpty) {
+              val idxExpr = termToNat(sApply.args.head, stateName)
+              baseType match {
+                case Some(_: Vec) => s"vecSelect ${fromStr} ${idxExpr}"
+                case _ => s"bvSlice ${fromStr} ${idxExpr} ${idxExpr}"
+              }
+            } else {
+              s"${fromStr}.${n}"
+            }
+          case "+" | "-" | "*" | "/" | "%" | "=" | ">" | "<" | ">=" | "<=" | "&&" | "||" =>
+            s"(${fromStr} ${n} ${args.head})"
+          case "natShiftLeft" | "natShiftRight" =>
+            if (fromStr.trim.startsWith("-")) "0" else s"${n} ${fromStr} ${args.head}"
+          case "forall" =>
+            if (args.nonEmpty) s"List.all ${fromStr} ${args.head}" else s"List.all ${fromStr}"
+          case _ =>
+            if (args.isEmpty) s"${fromStr}.${n}" else s"${fromStr}.${n} ${args.mkString(" ")}"
+        }
+      case SLib(name, _) =>
+        name match {
+          case "scala.`package`.Seq.apply" | "scala.`package`.List.apply" =>
+            if (args.isEmpty) "[]" else s"[${args.mkString(", ")}]"
+          case n if n.endsWith(".take") || n.endsWith("take") =>
+            if (args.length >= 2) s"${args.head}.take ${args(1)}"
+            else if (args.nonEmpty) s"${args.head}.take 0"
+            else "[]"
+          case n if n.endsWith(".drop") || n.endsWith("drop") =>
+            if (args.length >= 2) s"${args.head}.drop ${args(1)}"
+            else if (args.nonEmpty) s"${args.head}.drop 0"
+            else "[]"
+          case n if n.endsWith("log2Ceil") || n.endsWith("log2Up") || n.endsWith("log2Floor") =>
+            s"${n.split('.').last} ${args.mkString(" ")}"
+          case n if n.endsWith("Log2") || n.contains("Log2.") =>
+            s"log2 ${args.mkString(" ")}"
+          case _ =>
+            s"${args.mkString(" ")}".trim
         }
       case SIdent(name, _) => s"${name} ${args.mkString(" ")}".trim
       case _ => s"${args.mkString(" ")}".trim
@@ -490,15 +1313,364 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
   private def sSelectLean(sSelect: SSelect, stateName: String): String = {
     val from = mTermToLean(sSelect.from, stateName, leftSide = false)
     val name = sSelect.name.toString()
-    s"${from}.${name}"
+    name match {
+      case "bitLength" => s"bitLength ${from}"
+      case "log2Ceil"  => s"log2Ceil ${from}"
+      case "log2Up"    => s"log2Up ${from}"
+      case "log2Floor" => s"log2Floor ${from}"
+      case "getWidth" =>
+        termSignalType(sSelect.from) match {
+          case Some(UInt(w, _, _)) => if (isInferredWidth(w)) defaultWidthParam.getOrElse("1") else widthToLean(w)
+          case Some(SInt(w, _, _)) => if (isInferredWidth(w)) defaultWidthParam.getOrElse("1") else widthToLean(w)
+          case Some(Bool(_, _))    => "1"
+          case _                   => "1"
+        }
+      case "nonEmpty" => s"!(${from}).isEmpty"
+      case "size" => s"${from}.length"
+      case "asUInt" | "asSInt" | "asBool" => from
+      case "B" => s"boolToBv1 ${from}"
+      case "U" | "S" =>
+        sSelect.tpe match {
+          case sig: SignalType =>
+            val width = signalWidthFromType(sig).getOrElse("1")
+            s"(BitVec.ofNat (${width}) ${termToNat(sSelect.from, stateName)})"
+          case _ => from
+        }
+      case "W" => mTermToLean(sSelect.from, stateName, leftSide = false)
+      case _           => s"${from}.${name}"
+    }
   }
 
   private def sTermToLean(term: STerm): String = term match {
-    case SLiteral(value, _) => value.toString()
+    case s: SLiteral => sLiteralLean(s)
     case SIdent(name, _) => name.toString()
     case s: SApply => sApplyLean(s, "st0")
     case s: SSelect => sSelectLean(s, "st0")
     case _ => "1"
+  }
+
+  private def mTypeToLean(tpe: MType): String = tpe match {
+    case s: SignalType => signalTypeToLean(s)
+    case s: SType      => sTypeToLean(s)
+    case _             => "Nat"
+  }
+
+  private def mTypeToLeanWithFallback(tpe: MType, widthOpt: Option[String]): String = tpe match {
+    case sig: SignalType =>
+      sig match {
+        case UInt(w, _, _) if isInferredWidth(w) =>
+          widthOpt.map(w => s"BitVec ${w}").getOrElse(signalTypeToLean(sig))
+        case SInt(w, _, _) if isInferredWidth(w) =>
+          widthOpt.map(w => s"BitVec ${w}").getOrElse(signalTypeToLean(sig))
+        case _ => signalTypeToLean(sig)
+      }
+    case StTuple(tparams) =>
+      tparams.map(tp => mTypeToLeanWithFallback(tp, widthOpt)).mkString(" × ")
+    case _ => mTypeToLean(tpe)
+  }
+
+  private def mTypeToLeanForParam(tpe: MType): String = tpe match {
+    case s: SignalType => signalTypeToLeanForParam(s)
+    case _             => mTypeToLean(tpe)
+  }
+
+  private def mTypeDefault(tpe: MType): String = tpe match {
+    case s: SignalType => signalDefault(s)
+    case StBoolean     => "false"
+    case StInt         => "0"
+    case StBigInt      => "0"
+    case StUnit        => "unit"
+    case StTuple(tparams) =>
+      s"(${tparams.map(mTypeDefault).mkString(", ")})"
+    case StSeq(_)      => "[]"
+    case StArray(_)    => "[]"
+    case _             => "0"
+  }
+
+  private def wrapIfNeeded(expr: String): String = {
+    val trimmed = expr.trim
+    val needsParens =
+      trimmed.contains(" ") || trimmed.startsWith("if ") || trimmed.startsWith("fun ") ||
+        trimmed.startsWith("match ") || trimmed.startsWith("let ")
+    if (needsParens) s"(${expr})" else expr
+  }
+
+  private def termSignalType(term: MTerm): Option[SignalType] = term match {
+    case SignalRef(_, tpe) => Some(tpe)
+    case CApply(_, tpe, _) => Some(tpe)
+    case Lit(_, tpe)       => Some(tpe)
+    case s: SApply =>
+      s.tpe match {
+        case sig: SignalType => Some(sig)
+        case _               => None
+      }
+    case s: SSelect =>
+      s.tpe match {
+        case sig: SignalType => Some(sig)
+        case _               => None
+      }
+    case s: SIdent =>
+      localBindingTypes
+        .get(leanIdent(s.name.toString()))
+        .collect { case sig: SignalType => sig }
+        .orElse {
+          s.tpe match {
+            case sig: SignalType => Some(sig)
+            case _               => None
+          }
+        }
+    case _ => None
+  }
+
+  private def termWidth(term: MTerm): Option[String] = term match {
+    case SignalRef(_, tpe) => signalWidthFromType(tpe)
+    case Lit(_, tpe)       => signalWidthFromType(tpe)
+    case CApply(_, tpe, _) => signalWidthFromType(tpe)
+    case s: SIdent =>
+      termSignalType(s).flatMap {
+        case UInt(w, _, _) if isInferredWidth(w) =>
+          currentNatParam.orElse(currentBitVecParamWidth).orElse(defaultWidthParam)
+        case SInt(w, _, _) if isInferredWidth(w) =>
+          currentNatParam.orElse(currentBitVecParamWidth).orElse(defaultWidthParam)
+        case sig => signalWidthFromType(sig)
+      }
+    case _                 => None
+  }
+
+  private def termWidthWithState(term: MTerm, stateName: String): Option[String] = term match {
+    case c: CApply =>
+      val computed = c.op match {
+        case Slice =>
+          if (c.operands.length >= 3) {
+            val hi = termToNat(c.operands(1), stateName)
+            val lo = termToNat(c.operands(2), stateName)
+            Some(s"(${hi} - ${lo} + 1)")
+          } else if (c.operands.length == 2) {
+            Some("1")
+          } else {
+            None
+          }
+        case VecSelect =>
+          Some("1")
+        case Fill =>
+          c.operands.headOption.map(op => termToNat(op, stateName))
+        case Cat =>
+          val widths = c.operands.map(op => termWidthWithState(op, stateName))
+          if (widths.forall(_.isDefined)) {
+            Some(widths.flatten.reduceLeft((a, b) => s"(${a} + ${b})"))
+          } else {
+            None
+          }
+        case _ => None
+      }
+      computed.orElse(signalWidthFromType(c.tpe))
+    case _ => termWidth(term)
+  }
+
+  private def termToNat(term: MTerm, stateName: String): String = {
+    val expr = mTermToLean(term, stateName, leftSide = false)
+    if (expr.matches("-?\\d+")) expr
+    else if (termIsBitVec(term)) s"(${expr}).toNat" else expr
+  }
+
+  private def termIsBitVec(term: MTerm): Boolean = term match {
+    case _: SignalRef => true
+    case _: CApply    => true
+    case _: Lit       => true
+    case s: SApply =>
+      s.tpe match {
+        case _: SignalType => true
+        case _             => false
+      }
+    case s: SSelect =>
+      s.tpe match {
+        case _: SignalType => true
+        case _             => false
+      }
+    case s: SIdent =>
+      localBindingTypes
+        .get(leanIdent(s.name.toString()))
+        .exists(_.isInstanceOf[SignalType]) ||
+      (s.tpe match {
+        case _: SignalType => true
+        case _             => false
+      })
+    case s: SIf =>
+      s.tpe match {
+        case _: SignalType => true
+        case _             => false
+      }
+    case _ => false
+  }
+
+  private def translateOpName(name: String): String = {
+    val mapping = Map(
+      "$plus" -> "+",
+      "$minus" -> "-",
+      "$times" -> "*",
+      "$div" -> "/",
+      "$percent" -> "%",
+      "$eq$eq" -> "=",
+      "$greater" -> ">",
+      "$less" -> "<",
+      "$greater$eq" -> ">=",
+      "$less$eq" -> "<=",
+      "$amp$amp" -> "&&",
+      "$bar$bar" -> "||",
+      "$less$less" -> "natShiftLeft",
+      "$greater$greater" -> "natShiftRight"
+    )
+    mapping.getOrElse(name, name)
+  }
+
+  private def defBodyToLean(body: MStatement, stateName: String): String = body match {
+    case s: SBlock =>
+      val last = s.body.lastOption
+      last match {
+        case Some(m: MTerm) => mTermToLean(m, stateName, leftSide = false)
+        case _ => "0"
+      }
+    case m: MTerm => mTermToLean(m, stateName, leftSide = false)
+    case _ => "0"
+  }
+
+  private def defBodyExpr(body: MStatement, stateName: String): String = {
+    def addLets(stmts: List[MStatement]): String = {
+      var exprOpt: Option[String] = None
+      stmts.reverse.foreach {
+        case s: SValDef =>
+          val rhs = mTermToLean(s.rhs, stateName, leftSide = false)
+          val rest = exprOpt.getOrElse("0")
+          exprOpt = Some(s"let ${leanIdent(s.name.toString())} := ${rhs}; ${rest}")
+        case n: NodeDef =>
+          val rhs = mTermToLean(n.rhs, stateName, leftSide = false)
+          val rest = exprOpt.getOrElse("0")
+          exprOpt = Some(s"let ${leanIdent(n.name.toString())} := ${rhs}; ${rest}")
+        case w: WireDef =>
+          val rhs = w.someInit.map(mTermToLean(_, stateName, leftSide = false)).getOrElse(signalDefault(w.tpe))
+          val rest = exprOpt.getOrElse("0")
+          exprOpt = Some(s"let ${leanIdent(w.name.toString())} := ${rhs}; ${rest}")
+        case s: SUnapplyDef =>
+          val rest = exprOpt.getOrElse("0")
+          val rhs = mTermToLean(s.rhs, stateName, leftSide = false)
+          val letExpr =
+            s.rhs match {
+              case STuple(args, _) if args.length == s.names.length =>
+                s.names
+                  .zip(args)
+                  .foldRight(rest) { case ((name, term), acc) =>
+                    val t = mTermToLean(term, stateName, leftSide = false)
+                    s"let ${leanIdent(name.toString())} := ${t}; ${acc}"
+                  }
+              case _ =>
+                s"let (${s.names.map(n => leanIdent(n.toString())).mkString(", ")}) := ${rhs}; ${rest}"
+            }
+          exprOpt = Some(letExpr)
+        case m: MTerm =>
+          if (exprOpt.isEmpty) {
+            exprOpt = Some(mTermToLean(m, stateName, leftSide = false))
+          }
+        case _ =>
+          ()
+      }
+      exprOpt.getOrElse("0")
+    }
+
+    body match {
+      case s: SBlock => addLets(s.body)
+      case m: MTerm  => mTermToLean(m, stateName, leftSide = false)
+      case _         => "0"
+    }
+  }
+
+  private def defBodyTermOpt(body: MStatement): Option[MTerm] = body match {
+    case s: SBlock =>
+      s.body.lastOption.collect { case m: MTerm => m }
+    case m: MTerm => Some(m)
+    case _ => None
+  }
+
+  private def defBodyLocalNames(body: MStatement): Set[String] = {
+    def collect(stmts: List[MStatement]): Set[String] = {
+      stmts.flatMap {
+        case s: SValDef => List(leanIdent(s.name.toString()))
+        case n: NodeDef => List(leanIdent(n.name.toString()))
+        case w: WireDef => List(leanIdent(w.name.toString()))
+        case s: SUnapplyDef => s.names.map(n => leanIdent(n.toString()))
+        case s: SBlock => collect(s.body).toList
+        case _ => Nil
+      }.toSet
+    }
+    body match {
+      case s: SBlock => collect(s.body)
+      case s: SValDef => Set(leanIdent(s.name.toString()))
+      case s: SUnapplyDef => s.names.map(n => leanIdent(n.toString())).toSet
+      case _ => Set.empty
+    }
+  }
+
+  private def defBodyLocalTypes(body: MStatement): Map[String, MType] = {
+    def collect(stmts: List[MStatement]): Map[String, MType] = {
+      stmts.foldLeft(Map.empty[String, MType]) { (acc, stmt) =>
+        stmt match {
+          case s: SValDef => acc + (leanIdent(s.name.toString()) -> s.tpe)
+          case n: NodeDef => acc + (leanIdent(n.name.toString()) -> n.tpe)
+          case w: WireDef => acc + (leanIdent(w.name.toString()) -> w.tpe)
+          case s: SBlock => acc ++ collect(s.body)
+          case _ => acc
+        }
+      }
+    }
+    body match {
+      case s: SBlock => collect(s.body)
+      case s: SValDef => Map(leanIdent(s.name.toString()) -> s.tpe)
+      case _ => Map.empty
+    }
+  }
+
+  private def bitVecWidthFromTypeString(tpe: String): Option[String] = {
+    val trimmed = tpe.trim
+    if (!trimmed.startsWith("BitVec")) None
+    else {
+      val rest = trimmed.stripPrefix("BitVec").trim
+      if (rest.startsWith("(") && rest.endsWith(")")) {
+        Some(rest.drop(1).dropRight(1).trim)
+      } else if (rest.length > 0) {
+        Some(rest)
+      } else {
+        None
+      }
+    }
+  }
+
+  private def defReturnTypeAndDefault(s: SDefDef, paramNames: List[String]): (String, String) = {
+    s.tpe match {
+      case sig: SignalType =>
+        sig match {
+          case UInt(width, _, _) if isInferredWidth(width) =>
+            val w = defaultWidthParam.getOrElse(widthToLean(width))
+            (s"BitVec ${w}", s"(BitVec.ofNat ${w} 0)")
+          case SInt(width, _, _) if isInferredWidth(width) =>
+            val w = defaultWidthParam.getOrElse(widthToLean(width))
+            (s"BitVec ${w}", s"(BitVec.ofNat ${w} 0)")
+          case _ =>
+            (signalTypeToLean(sig), mTypeDefault(sig))
+        }
+      case _ =>
+        (mTypeToLean(s.tpe), mTypeDefault(s.tpe))
+    }
+  }
+
+  private def stringLiteralToNat(value: String): String = {
+    if (value.startsWith("b") || value.startsWith("B")) {
+      BigInt(value.drop(1), 2).toString()
+    } else if (value.startsWith("h") || value.startsWith("H")) {
+      BigInt(value.drop(1), 16).toString()
+    } else if (value.startsWith("d") || value.startsWith("D")) {
+      BigInt(value.drop(1), 10).toString()
+    } else {
+      BigInt(value, 10).toString()
+    }
   }
 
   private def paramsSignature(params: List[String]): String = {
@@ -528,29 +1700,18 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     case _                   => None
   }
 
-  private def subModuleRunCL(subModuleRun: SubModuleRun, fromState: String, toState: String): CodeLines = {
-    val (pkgOpt, modName) = splitModuleName(subModuleRun.moduleType.fullName)
-    val prefix = pkgOpt.filter(_ != currentPkg).map(_ + ".").getOrElse("")
-    val transName = prefix + lowerName(modName) + "Trans"
-    val inputsName = prefix + modName + "Inputs"
-    val regsName = prefix + modName + "Regs"
-
-    val inputFields = subModuleRun.inputSignals.zip(subModuleRun.inputRefs).map {
-      case ((name, _), ref) =>
-        s"${name} := ${mTermToLean(ref, fromState, leftSide = false)}"
-    }
-    val inputsExpr =
-      if (inputFields.isEmpty) s"({} : ${inputsName})"
-      else s"({ ${inputFields.mkString(", ")} } : ${inputsName})"
-
-    val regsExpr = s"({} : ${regsName})"
-    val outputsName = s"${toState}SubOut"
-
+  private def subModuleRunCL(
+      subModuleRun: SubModuleRun,
+      fromState: String,
+      toState: String,
+      stateType: Option[String]
+  ): CodeLines = {
+    val stateAnnot = stateType.map(t => s": ${t}").getOrElse("")
     var lastState = fromState
     val updatesCL = subModuleRun.outputSignals.zip(subModuleRun.outputNames).map {
-      case ((name, _), outName) =>
-        val nextState = s"${toState}_${name}"
-        val update = s"let ${nextState} := { ${lastState} with ${outName.toString()} := ${outputsName}.${name} }"
+      case ((_, tpe), outName) =>
+        val nextState = s"${toState}_${outName.toString()}"
+        val update = s"let ${nextState} ${stateAnnot} := { ${lastState} with ${outName.toString()} := ${signalDefault(tpe)} }"
         lastState = nextState
         CodeLines(update)
     }.toCodeLines
@@ -558,9 +1719,8 @@ trait LeanEmitter extends CodeLinesImplicit { self: ChicalaAst =>
     val finalState = if (lastState == fromState) fromState else lastState
 
     CodeLines(
-      s"let (${outputsName}, _) := ${transName} ${inputsExpr} ${regsExpr}",
       updatesCL,
-      s"let ${toState} := ${finalState}"
+      s"let ${toState} ${stateAnnot} := ${finalState}"
     )
   }
 
