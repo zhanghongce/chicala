@@ -11,6 +11,7 @@ import chicala.util.Format
 import chicala.convert.frontend.Scala2Reader
 import chicala.util.Printer
 import chicala.convert.backend.stainless.StainlessEmitter
+import chicala.convert.backend.lean4.LeanEmitter
 import chicala.convert.pass._
 import chicala.ChicalaConfig
 
@@ -30,12 +31,13 @@ class ChiselToScalaComponent(val global: Global) extends PluginComponent {
 
   def newPhase(_prev: Phase) = new ChiselToScalaPhase(_prev)
 
-  class ChiselToScalaPhase(prev: Phase)
-      extends StdPhase(prev)
-      with Scala2Reader
-      with ChicalaPassCollecttion
-      with StainlessEmitter
-      with Format {
+    class ChiselToScalaPhase(prev: Phase)
+        extends StdPhase(prev)
+        with Scala2Reader
+        with ChicalaPassCollecttion
+        with StainlessEmitter
+        with LeanEmitter
+        with Format {
     lazy val global: ChiselToScalaComponent.this.global.type = ChiselToScalaComponent.this.global
 
     val testRunDir = new File("test_run_dir/" + phaseName)
@@ -139,6 +141,17 @@ class ChiselToScalaComponent(val global: Global) extends PluginComponent {
                       outputDir + s"/${name}.simscala.scala",
                       EmitStainless(m)
                     )
+                  if (ChicalaConfig.lean) {
+                    val leanRunDir = new File("test_run_dir/chiselToLean4")
+                    val leanOutputDir =
+                      s"${leanRunDir.getPath()}/out/${packageName.replace(".", "/")}"
+                    leanRunDir.mkdirs()
+                    (new File(leanOutputDir)).mkdirs()
+                    Format.saveToFile(
+                      leanOutputDir + s"/${name}.lean",
+                      EmitLean(m)
+                    )
+                  }
                 case _ =>
               }
 
